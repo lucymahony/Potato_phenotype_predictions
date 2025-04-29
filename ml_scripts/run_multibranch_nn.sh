@@ -11,7 +11,3 @@ source ~/.bashrc
 mamba activate /hpc-home/mahony/miniforge3
 conda run -n transformers python multibranch_nn.py
 
-
-##SBATCH --mem 1G				# memory pool for all cores
-##SBATCH --time=0-00:10:00				# time limit
-##SBATCH --gres=gpu:1
