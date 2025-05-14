@@ -21,26 +21,22 @@ class PreprocessedMultiOmicDataset(Dataset):
         return (self.lc[idx], self.gc[idx], self.trans[idx]), self.targets[idx]
 
 
+from torch.nn import Dropout
+
 class MultiBranchNet(nn.Module):
-    def __init__(self, input_sizes, hidden_size=128, output_size=1):
+    def __init__(self, input_sizes, hidden_size=128, output_size=1, depth=10):
         super().__init__()
         lc_size, gc_size, trans_size = input_sizes
 
-        self.lc_branch = nn.Sequential(
-            nn.Linear(lc_size, hidden_size),
-            nn.ReLU(),
-            nn.BatchNorm1d(hidden_size),
-        )
-        self.gc_branch = nn.Sequential(
-            nn.Linear(gc_size, hidden_size),
-            nn.ReLU(),
-            nn.BatchNorm1d(hidden_size),
-        )
-        self.trans_branch = nn.Sequential(
-            nn.Linear(trans_size, hidden_size),
-            nn.ReLU(),
-            nn.BatchNorm1d(hidden_size),
-        )
+        def make_branch(input_size):
+            layers = [nn.Linear(input_size, hidden_size), nn.ReLU(), nn.BatchNorm1d(hidden_size), Dropout(0.3)]
+            for _ in range(depth - 1):
+                layers.extend([nn.Linear(hidden_size, hidden_size), nn.ReLU(), nn.BatchNorm1d(hidden_size), Dropout(0.3)])
+            return nn.Sequential(*layers)
+
+        self.lc_branch = make_branch(lc_size)
+        self.gc_branch = make_branch(gc_size)
+        self.trans_branch = make_branch(trans_size)
 
         self.head = nn.Sequential(
             nn.Linear(hidden_size * 3, 128),
@@ -57,11 +53,13 @@ class MultiBranchNet(nn.Module):
         return self.head(merged)
 
 
-def train_model(model, dataset, device, output_file_path, epochs=100, batch_size=6, lr=1e-3, patience=10):
+def train_model(model, dataset, device, output_file_path, epochs=1000, batch_size=6, lr=1e-3, patience=20):
+    loss_history = []
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     model = model.to(device)
     criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
 
     print(f"Starting training with lr={lr}...\n")
     best_loss = float('inf')
@@ -83,7 +81,9 @@ def train_model(model, dataset, device, output_file_path, epochs=100, batch_size
 
         epoch_loss = running_loss / len(loader)
         print(f"Epoch {epoch + 1:02d} | Avg Loss: {epoch_loss:.4f}")
+        loss_history.append(epoch_loss)
 
+        scheduler.step(epoch_loss)
         if epoch_loss < best_loss:
             best_loss = epoch_loss
             torch.save(model.state_dict(), output_file_path)
@@ -93,6 +93,8 @@ def train_model(model, dataset, device, output_file_path, epochs=100, batch_size
             if epochs_no_improve >= patience:
                 print("Early stopping triggered.")
                 break
+
+    return loss_history
 
 
 def test_model(model, test_dataset, device, output_file_path, batch_size=6):
@@ -118,7 +120,7 @@ def test_model(model, test_dataset, device, output_file_path, batch_size=6):
     return torch.cat(all_preds), torch.cat(all_targets)
 
 
-def plot_results(preds, targets, output_file_path):
+def plot_results(preds, targets, output_file_path, title_label=""):
     preds_np = preds.flatten()
     targets_np = targets.flatten()
     r2 = r2_score(targets_np, preds_np)
@@ -129,7 +131,7 @@ def plot_results(preds, targets, output_file_path):
     plt.plot([targets_np.min(), targets_np.max()], [targets_np.min(), targets_np.max()], 'r--')
     plt.xlabel("True Values")
     plt.ylabel("Predicted Values")
-    plt.title(f"Prediction vs True | R² = {r2:.2f}")
+    plt.title(f"Prediction vs True | {title_label} | R² = {r2:.2f}")
     plt.grid(True)
     plt.tight_layout()
     os.makedirs(os.path.dirname(output_file_path), exist_ok=True)
@@ -142,6 +144,7 @@ if __name__ == "__main__":
     data = torch.load('../intermediate_data/preprocessed_dataset.pt')
     target_keys = [['colour'], ['tubershape'], ['decol5min'], ['DSC_Onset']]
     results = []
+    train_r2_scores = []
 
     for key in target_keys:
         raw_targets = torch.tensor([[t[k] for k in key] for t in data['phenotypes']], dtype=torch.float32)
@@ -154,20 +157,38 @@ if __name__ == "__main__":
         test_size = len(dataset) - train_size
         train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
 
-        for lr in [1e-3, 1e-4, 3e-4, 3e-5, 3e-2]:
+        for lr in [3e-2, 3e-3, 3e-4, 3e-5, 3e-6]:
             print(f"\n--- Training {key[0]} with learning rate: {lr} ---")
             model = MultiBranchNet(
                 input_sizes=(dataset.lc.shape[1], dataset.gc.shape[1], dataset.trans.shape[1]),
                 output_size=1
             )
             model_file = f"../intermediate_data/model_{key[0]}_lr{lr}.pth"
-            train_model(model, train_dataset, device, model_file, epochs=100, batch_size=6, lr=lr, patience=10)
+            losses = train_model(model, train_dataset, device, model_file, epochs=100, batch_size=6, lr=lr, patience=10)
+
+            train_preds, train_targets = test_model(model, train_dataset, device, model_file, batch_size=6)
+            train_preds = scaler.inverse_transform(train_preds.numpy())
+            train_targets = scaler.inverse_transform(train_targets.numpy())
+            train_r2 = plot_results(torch.tensor(train_preds), torch.tensor(train_targets), f"../plots/train_plot_{key[0]}_lr{lr}.png", title_label=f"Train {key[0]}")
+            # Plot training loss
+            plt.figure()
+            plt.plot(losses, label="Train Loss")
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss")
+            plt.title(f"Training Loss | {key[0]} | lr={lr}")
+            plt.legend()
+            plt.grid(True)
+            os.makedirs("../plots/loss_curves", exist_ok=True)
+            plt.savefig(f"../plots/loss_curves/loss_curve_{key[0]}_lr{lr}.png")
 
             preds, targets = test_model(model, test_dataset, device, model_file, batch_size=6)
             preds = scaler.inverse_transform(preds.numpy())
             targets = scaler.inverse_transform(targets.numpy())
-            r2 = plot_results(torch.tensor(preds), torch.tensor(targets), f"../plots/plot_{key[0]}_lr{lr}.png")
+            r2 = plot_results(torch.tensor(preds), torch.tensor(targets), f"../plots/test_plot_{key[0]}_lr{lr}.png", title_label=f"Test {key[0]}")
             results.append({"target": key[0], "lr": lr, "r2": r2})
+            train_r2_scores.append({"target": key[0], "lr": lr, "r2": train_r2})
 
     df_results = pd.DataFrame(results)
-    df_results.to_csv("../intermediate_data/model_r2_scores.csv", index=False)
+    df_train_r2 = pd.DataFrame(train_r2_scores)
+    df_results.to_csv("../intermediate_data/model_r2_scores_test.csv", index=False)
+    df_train_r2.to_csv("../intermediate_data/model_r2_scores_train.csv", index=False)

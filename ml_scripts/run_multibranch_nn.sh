@@ -9,5 +9,5 @@
 
 source ~/.bashrc 
 mamba activate /hpc-home/mahony/miniforge3
-conda run -n transformers python multibranch_nn.py
+conda run -n transformers python multibranch_depth.py
 
